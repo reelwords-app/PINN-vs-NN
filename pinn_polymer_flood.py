@@ -55,7 +55,12 @@ MU_WI    = 1.0           # pure-water viscosity [cp]
 FWM      = 0.12          # initial mobile water fraction
 SW_INIT  = SWC + FWM * (1.0 - SWC - SOR)
 
-L_INJE   = 175.0         # injector-producer spacing [m]  (Pelican Lake HP-6)
+# Pelican Lake HP-6 geometry
+L_INJE   = 175.0         # injector-producer spacing [m]
+L_WELL   = 1400.0        # horizontal well length [m]
+H_RES    = 14.434692     # reservoir thickness [ft]
+PHI      = 0.312         # porosity
+BBL_TO_M3 = 0.158987     # bbl → m³
 
 # ==============================================================================
 # 2.  DATA PIPELINE
@@ -71,9 +76,11 @@ def load_wide(path):
     return df
 
 print("[DATA] Loading CSVs …")
-wc_df = load_wide(os.path.join(DATA_DIR, 'Water cut.csv'))
-op_df = load_wide(os.path.join(DATA_DIR, 'Oil Production.csv'))
-cp_df = load_wide(os.path.join(DATA_DIR, 'Polymer concentration.csv'))
+wc_df  = load_wide(os.path.join(DATA_DIR, 'Water cut.csv'))
+op_df  = load_wide(os.path.join(DATA_DIR, 'Oil Production.csv'))
+cp_df  = load_wide(os.path.join(DATA_DIR, 'Polymer concentration.csv'))
+inj1_df= load_wide(os.path.join(DATA_DIR, 'Injection rate inj1.csv'))
+inj2_df= load_wide(os.path.join(DATA_DIR, 'Injection rate inj2.csv'))
 
 idx   = wc_df.index.intersection(op_df.index).intersection(cp_df.index)
 wc_df, op_df, cp_df = wc_df.loc[idx], op_df.loc[idx], cp_df.loc[idx]
@@ -83,6 +90,24 @@ N_T     = len(idx)
 T_SPAN  = float(N_T - 1)
 DT_DAYS = float((idx[1] - idx[0]).days) if N_T > 1 else 13.33
 OIL_MAX = float(op_df[cases].values.max())
+
+# ── Compute exact vp = q·T_ref / (A·φ·L)  (paper formula, not trainable) ────
+# All 53 cases have identical injection rates — use case_1, ignore zero rows
+Q_I1_MEAN  = float(inj1_df['case_1'][inj1_df['case_1'] > 0].mean())  # bbl/day
+Q_I2_MEAN  = float(inj2_df['case_1'][inj2_df['case_1'] > 0].mean())  # bbl/day
+# Each injector splits equally to its two adjacent producers (Voronoi symmetry)
+Q_PER_PAIR = (Q_I1_MEAN + Q_I2_MEAN) / 4.0                          # bbl/day
+
+H_M        = H_RES * 0.3048                     # ft → m  = 4.401 m
+A_M2       = L_WELL * H_M                       # cross-section [m²] = 6161 m²
+Q_M3       = Q_PER_PAIR * BBL_TO_M3             # bbl/day → m³/day
+T_REF_DAYS = T_SPAN * DT_DAYS                   # total simulation duration [days]
+VP_EXACT   = float(Q_M3 * T_REF_DAYS / (A_M2 * PHI * L_INJE))  # dimensionless
+
+print(f"[VP]  Q_I1={Q_I1_MEAN:.1f} bbl/d  Q_I2={Q_I2_MEAN:.1f} bbl/d  "
+      f"q/pair={Q_PER_PAIR:.1f} bbl/d")
+print(f"      A={A_M2:.0f} m²  φ={PHI}  L={L_INJE} m  T_ref={T_REF_DAYS:.0f} d")
+print(f"      vp = q·T_ref/(A·φ·L) = {VP_EXACT:.4f}  (exact, not trainable)")
 
 t_norm   = np.arange(N_T, dtype=np.float32) / T_SPAN   # T ∈ [0, 1]
 
@@ -173,11 +198,11 @@ print(f"[COLLOC] Interior={N_COLLOC} | IC={N_IC} | InjectorBC={N_BC}")
 # ==============================================================================
 # 4.  TRAINABLE PHYSICAL PARAMETERS
 #     Stored in log/raw space so optimizer is unconstrained.
-#     exp()      → always positive  (Corey, kr, vp, qsc)
+#     exp()      → always positive  (Corey, kr, qsc)
 #     softplus() → always positive  (cubic viscosity r, s, t)
 #
-#     vp = q·T_ref / (A·φ·L)   — pore volumes injected (dimensionless)
-#          learned from data; absorbs injection rate, area, porosity, length
+#     vp = q·T_ref/(A·φ·L) is computed EXACTLY from known values above.
+#     It is a fixed constant, NOT trainable — matches paper exactly.
 # ==============================================================================
 log_nw  = tf.Variable(np.log(NW_INIT),  dtype='float32', name='log_nw')
 log_no  = tf.Variable(np.log(NO_INIT),  dtype='float32', name='log_no')
@@ -189,15 +214,15 @@ log_r   = tf.Variable(1.0,  dtype='float32', name='log_r')
 log_s   = tf.Variable(0.0,  dtype='float32', name='log_s')
 log_t   = tf.Variable(-1.0, dtype='float32', name='log_t')
 
-# vp: pore volumes injected — same for BL and polymer (same q/Aφ/L)
-log_vp  = tf.Variable(0.0, dtype='float32', name='log_vp')
-
-# Oil-rate scaling factor
+# Oil-rate scaling factor (accounts for unit conversion and well geometry)
 log_qsc = tf.Variable(0.0, dtype='float32', name='log_qsc')
 
 phys_vars = [log_nw, log_no, log_krw, log_kro,
              log_r,  log_s,  log_t,
-             log_vp, log_qsc]
+             log_qsc]
+
+# vp as a fixed TF constant — exact value from injection rate files + geometry
+_VP = tf.constant(VP_EXACT, dtype='float32')
 
 
 def get_phys():
@@ -208,9 +233,8 @@ def get_phys():
     r_v = tf.nn.softplus(log_r)
     s_v = tf.nn.softplus(log_s)
     t_v = tf.nn.softplus(log_t)
-    vp  = tf.exp(log_vp)
     qsc = tf.exp(log_qsc)
-    return nw, no, krw, kro, r_v, s_v, t_v, vp, qsc
+    return nw, no, krw, kro, r_v, s_v, t_v, qsc
 
 # ==============================================================================
 # 5.  FRACTIONAL FLOW — CUBIC POLYMER VISCOSITY  (Liu et al. Eq. 1, 3)
@@ -377,17 +401,18 @@ def pinn_losses(model, x_data, y_data,
     d2Sw_dX2 = tape2.gradient(dSw_dX, X_c)       # ∂²Sw/∂X²
     del tape2
 
-    _, _, _, _, _, _, _, vp, qsc = get_phys()
+    _, _, _, _, _, _, _, qsc = get_phys()
 
     # BL equation + artificial viscosity  (Liu et al. Eq. 9 + Eq. 16)
     # ∂Sw/∂T + vp·∂fw/∂X - ε·∂²Sw/∂X² = 0
-    R_BL = dSw_dT + vp * dfw_dX
+    # vp = q·T_ref/(A·φ·L) — exact value from injection rates (not trainable)
+    R_BL = dSw_dT + _VP * dfw_dX
     if d2Sw_dX2 is not None:
         R_BL = R_BL - EPS_AV * d2Sw_dX2
 
     # Full polymer equation  (Liu et al. Eq. 4)
     # ∂(Sw·Cp)/∂T + vp·∂(fw·Cp)/∂X = 0
-    R_Cp = dSwCp_dT + vp * dfwCp_dX
+    R_Cp = dSwCp_dT + _VP * dfwCp_dX
 
     L_BL     = tf.reduce_mean(tf.square(R_BL))
     L_Cp_pde = tf.reduce_mean(tf.square(R_Cp))
@@ -423,6 +448,7 @@ def pinn_losses(model, x_data, y_data,
     T_d   = tf.convert_to_tensor(x_data[:, 1:2], dtype='float32')
     C_d   = tf.convert_to_tensor(x_data[:, 2:3], dtype='float32')
 
+    _, _, _, _, _, _, _, qsc = get_phys()
     out_d    = model([X_d, T_d, C_d], training=training)
     Sw_d     = out_d[:, 0:1]
     Cp_d     = out_d[:, 1:2]
@@ -521,7 +547,6 @@ def train_pinn(model, tag='PINN-1D'):
             best_w   = model.get_weights()
 
         if ep % 100 == 0 or ep == 1:
-            vp_ = float(tf.exp(log_vp))
             nw_ = float(tf.exp(log_nw))
             r_  = float(tf.nn.softplus(log_r))
             s_  = float(tf.nn.softplus(log_s))
@@ -529,8 +554,7 @@ def train_pinn(model, tag='PINN-1D'):
             print(f"  Ep {ep:4d} | Ldata={hist['tr_data'][-1]:.5f} "
                   f"| BL={hist['tr_bl'][-1]:.5f} "
                   f"| Cp={hist['tr_cp'][-1]:.5f} | Val={val_loss:.5f} "
-                  f"| vp={vp_:.3f} nw={nw_:.2f} "
-                  f"r={r_:.2f} s={s_:.2f} t={t_:.2f}")
+                  f"| nw={nw_:.2f} r={r_:.2f} s={s_:.2f} t={t_:.2f}")
 
     model.set_weights(best_w)
 
@@ -632,10 +656,12 @@ kro_l = float(tf.exp(log_kro))
 r_l   = float(tf.nn.softplus(log_r))
 s_l   = float(tf.nn.softplus(log_s))
 t_l   = float(tf.nn.softplus(log_t))
-vp_l  = float(tf.exp(log_vp))
 qsc_l = float(tf.exp(log_qsc))
 
-print("\n[PHYSICS] Learned parameters:")
+print("\n[PHYSICS] Parameters:")
+print(f"  vp (EXACT) = {VP_EXACT:.4f}  ← q·T_ref/(A·φ·L), not trainable")
+print(f"               q={Q_PER_PAIR:.1f} bbl/d | A={A_M2:.0f} m² | "
+      f"φ={PHI} | L={L_INJE} m | T={T_REF_DAYS:.0f} d")
 print(f"  Corey nw   = {nw_l:.4f}  (prior {NW_INIT})")
 print(f"  Corey no   = {no_l:.4f}  (prior {NO_INIT})")
 print(f"  krw_max    = {krw_l:.4f}  (prior {KRW_INIT})")
@@ -644,7 +670,6 @@ print(f"  Cubic r    = {r_l:.4f}")
 print(f"  Cubic s    = {s_l:.4f}")
 print(f"  Cubic t    = {t_l:.4f}")
 print(f"  μw(Cp) = {MU_WI}·(1 + {r_l:.2f}·Cp + {s_l:.2f}·Cp² + {t_l:.2f}·Cp³)")
-print(f"  vp         = {vp_l:.4f}  (pore volumes injected = q·T_ref/(A·φ·L))")
 print(f"  q_scale    = {qsc_l:.4f}")
 
 # ==============================================================================
@@ -663,7 +688,7 @@ def pinn_predict(X_arr):
     Sw_n  = out[:, 0:1]
     Cp_n  = out[:, 1:2]
     fw, _ = fractional_flow(Sw_n, Cp_n)
-    _, _, _, _, _, _, _, _, qsc = get_phys()
+    _, _, _, _, _, _, _, qsc = get_phys()
     return np.concatenate([fw.numpy(), (qsc*(1.-fw)).numpy()], axis=1)
 
 
@@ -953,6 +978,6 @@ print(f"\n[SUMMARY]")
 print(f"  Spatial domain  : x ∈ [0, {L_INJE:.0f} m]  →  X ∈ [0, 1]")
 print(f"  Injector BC     : Sw(0,T)=1-Sor  Cp(0,T)=Cpi")
 print(f"  Producer data   : X=1  water cut + oil rate from CMG STARS")
-print(f"  Learned vp      : {vp_l:.4f}  (pore volumes injected)")
-print(f"  BL equation     : ∂Sw/∂T + {vp_l:.3f}·∂fw/∂X = {EPS_AV}·∂²Sw/∂X²")
-print(f"  Polymer eq      : ∂(Sw·Cp)/∂T + {vp_l:.3f}·∂(fw·Cp)/∂X = 0")
+print(f"  vp (exact)      : {VP_EXACT:.4f}  = q·T_ref/(A·φ·L)")
+print(f"  BL equation     : ∂Sw/∂T + {VP_EXACT:.3f}·∂fw/∂X = {EPS_AV}·∂²Sw/∂X²")
+print(f"  Polymer eq      : ∂(Sw·Cp)/∂T + {VP_EXACT:.3f}·∂(fw·Cp)/∂X = 0")
