@@ -222,8 +222,9 @@ def pinn_losses(model, x_batch, y_batch, training=True):
 
     L_ic    – Initial condition: Sw(t=0) = SW_INIT  (Paper 2 Eq. 6)
     """
-    t_in  = x_batch[:, 0:1]
-    cp_in = x_batch[:, 1:2]
+    # Cast to tf.Tensor so tape.watch() works whether input is ndarray or tensor
+    t_in  = tf.cast(x_batch[:, 0:1], tf.float32)
+    cp_in = tf.cast(x_batch[:, 1:2], tf.float32)
     _, _, _, _, _, vp, qsc = get_phys()
 
     # Auto-diff: track t so we can compute dSw/dt  (Paper 2 methodology)
