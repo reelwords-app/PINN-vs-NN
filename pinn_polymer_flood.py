@@ -2,7 +2,7 @@
 PINN for Polymer Flood Production Forecasting — 1D Spatial Model
 =================================================================
 Physics     : Liu et al. Physics of Fluids 37 036622 (2025)
-               • 1D BL eq:     ∂Sw/∂T + vp·∂fw/∂X = ε·∂²Sw/∂X²   (Eq. 9+16)
+               • 1D BL eq:     ∂Sw/∂T + vp·∂fw/∂X = 0              (Eq. 9)
                • Polymer eq:   ∂(Sw·Cp)/∂T + vp·∂(fw·Cp)/∂X = 0  (Eq. 4)
                • Cubic visc:   μw(Cp) = μwi(1+r·Cp+s·Cp²+t·Cp³)   (Eq. 1)
                • PINN-1:       one network → (Sw, Cp) simultaneously
@@ -170,9 +170,9 @@ def latin_hypercube(n, d=2, seed=0):
     return result
 
 
-N_COLLOC = 20_000
-N_IC     = 1_000
-N_BC     = 1_000
+N_COLLOC = 5_000
+N_IC     = 500
+N_BC     = 500
 
 # Interior: columns [X, T, Cpi]  all ∈ [0,1]
 X_col = latin_hypercube(N_COLLOC, d=3, seed=1).astype('f4')
@@ -316,8 +316,8 @@ def build_nn_network():
 # ==============================================================================
 # 7.  LOSS FUNCTIONS  (Liu et al. Eq. 8-10, exact 1-D physics)
 #
-#  BL equation   (Liu et al. Eq. 9 + Eq. 16 artificial viscosity):
-#    ∂Sw/∂T + vp·∂fw/∂X = ε·∂²Sw/∂X²       ε = 1e-3
+#  BL equation   (Liu et al. Eq. 9):
+#    ∂Sw/∂T + vp·∂fw/∂X = 0
 #
 #  Polymer equation  (Liu et al. Eq. 4, full product rule):
 #    ∂(Sw·Cp)/∂T + vp·∂(fw·Cp)/∂X = 0
@@ -343,7 +343,6 @@ W1,  W2,  W3  = 1.0, 1.0, 1.0
 W11, W12, W13 = 1.0, 5.0, 5.0   # BL PDE | IC Sw | BC Sw (injector)
 W21, W22, W23 = 1.0, 5.0, 5.0   # Cp PDE | IC Cp | BC Cp (injector)
 
-EPS_AV = 1e-3   # artificial viscosity (Liu et al. Example 3, optimal ε=1e-3)
 
 _SW_INIT_NORM = tf.constant((SW_INIT - SWC) / (1. - SWC - SOR), dtype='float32')
 _SW_INJ_NORM  = tf.constant(1.0, dtype='float32')   # Sw(0,T)=1-Sor → norm=1.0
@@ -373,38 +372,30 @@ def pinn_losses(model, x_data, y_data,
     T_c   = tf.convert_to_tensor(x_col[:, 1:2], dtype='float32')  # time
     Cpi_c = tf.convert_to_tensor(x_col[:, 2:3], dtype='float32')  # polymer
 
-    # Nested GradientTapes:
-    #   tape1 → first derivatives ∂/∂X and ∂/∂T
-    #   tape2 → second derivative ∂²/∂X² (for artificial viscosity)
-    with tf.GradientTape(persistent=True) as tape2:
-        tape2.watch([X_c, T_c])
-        with tf.GradientTape(persistent=True) as tape1:
-            tape1.watch([X_c, T_c])
-            out_c   = model([X_c, T_c, Cpi_c], training=False)
-            Sw_c    = out_c[:, 0:1]
-            Cp_c    = out_c[:, 1:2]
-            fw_c, _ = fractional_flow(Sw_c, Cp_c)
-            SwCp_c  = Sw_c * Cp_c    # for product-rule polymer eq
-            fwCp_c  = fw_c * Cp_c
+    # Single GradientTape — first derivatives ∂/∂X and ∂/∂T only.
+    # Artificial viscosity (ε·∂²Sw/∂X²) is dropped: the nested tape that
+    # computes the second derivative is the main training bottleneck.
+    with tf.GradientTape(persistent=True) as tape1:
+        tape1.watch([X_c, T_c])
+        out_c   = model([X_c, T_c, Cpi_c], training=False)
+        Sw_c    = out_c[:, 0:1]
+        Cp_c    = out_c[:, 1:2]
+        fw_c, _ = fractional_flow(Sw_c, Cp_c)
+        SwCp_c  = Sw_c * Cp_c
+        fwCp_c  = fw_c * Cp_c
 
-        dSw_dT   = tape1.gradient(Sw_c,   T_c)   # ∂Sw/∂T
-        dSw_dX   = tape1.gradient(Sw_c,   X_c)   # ∂Sw/∂X  (→ 2nd deriv)
-        dfw_dX   = tape1.gradient(fw_c,   X_c)   # ∂fw/∂X
-        dSwCp_dT = tape1.gradient(SwCp_c, T_c)   # ∂(Sw·Cp)/∂T
-        dfwCp_dX = tape1.gradient(fwCp_c, X_c)   # ∂(fw·Cp)/∂X
-        del tape1
-
-    d2Sw_dX2 = tape2.gradient(dSw_dX, X_c)       # ∂²Sw/∂X²
-    del tape2
+    dSw_dT   = tape1.gradient(Sw_c,   T_c)   # ∂Sw/∂T
+    dfw_dX   = tape1.gradient(fw_c,   X_c)   # ∂fw/∂X
+    dSwCp_dT = tape1.gradient(SwCp_c, T_c)   # ∂(Sw·Cp)/∂T
+    dfwCp_dX = tape1.gradient(fwCp_c, X_c)   # ∂(fw·Cp)/∂X
+    del tape1
 
     _, _, _, qsc = get_phys()
 
-    # BL equation + artificial viscosity  (Liu et al. Eq. 9 + Eq. 16)
-    # ∂Sw/∂T + vp·∂fw/∂X - ε·∂²Sw/∂X² = 0
+    # BL equation  (Liu et al. Eq. 9)
+    # ∂Sw/∂T + vp·∂fw/∂X = 0
     # vp = q·T_ref/(A·φ·L) — exact value from injection rates (not trainable)
     R_BL = dSw_dT + _VP * dfw_dX
-    if d2Sw_dX2 is not None:
-        R_BL = R_BL - EPS_AV * d2Sw_dX2
 
     # Full polymer equation  (Liu et al. Eq. 4)
     # ∂(Sw·Cp)/∂T + vp·∂(fw·Cp)/∂X = 0
@@ -786,7 +777,7 @@ for ax in axes1:
     ax.set_xlabel('Epoch'); ax.set_ylabel('Loss (log scale)')
     ax.legend(fontsize=7); ax.grid(True, which='both', alpha=.3)
 fig1.suptitle(
-    'Training losses  |  BL: ∂Sw/∂T + vp·∂fw/∂X = ε·∂²Sw/∂X²  '
+    'Training losses  |  BL: ∂Sw/∂T + vp·∂fw/∂X = 0  '
     '|  Polymer: ∂(Sw·Cp)/∂T + vp·∂(fw·Cp)/∂X = 0',
     fontweight='bold', fontsize=10)
 fig1.tight_layout()
@@ -970,5 +961,5 @@ print(f"  Spatial domain  : x ∈ [0, {L_INJE:.0f} m]  →  X ∈ [0, 1]")
 print(f"  Injector BC     : Sw(0,T)=1-Sor  Cp(0,T)=Cpi")
 print(f"  Producer data   : X=1  water cut + oil rate from CMG STARS")
 print(f"  vp (exact)      : {VP_EXACT:.4f}  = q·T_ref/(A·φ·L)")
-print(f"  BL equation     : ∂Sw/∂T + {VP_EXACT:.3f}·∂fw/∂X = {EPS_AV}·∂²Sw/∂X²")
+print(f"  BL equation     : ∂Sw/∂T + {VP_EXACT:.3f}·∂fw/∂X = 0")
 print(f"  Polymer eq      : ∂(Sw·Cp)/∂T + {VP_EXACT:.3f}·∂(fw·Cp)/∂X = 0")
