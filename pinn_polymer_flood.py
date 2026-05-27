@@ -137,23 +137,23 @@ print(f"[COLLOC] Interior={N_COLLOC}  IC={N_IC}  (Liu et al. Table I)")
 #     — Pore-volume scale vp, oil-rate qsc    (Meng et al. Paper 1, Table 1)
 #     All stored in log-space (→ always positive).
 # ==============================================================================
-log_nw    = tf.Variable(np.log(NW_INIT),  dtype='f4', name='log_nw')
-log_no    = tf.Variable(np.log(NO_INIT),  dtype='f4', name='log_no')
-log_krw   = tf.Variable(np.log(KRW_INIT), dtype='f4', name='log_krw')
-log_kro   = tf.Variable(np.log(KRO_INIT), dtype='f4', name='log_kro')
+log_nw    = tf.Variable(np.log(NW_INIT),  dtype='float32', name='log_nw')
+log_no    = tf.Variable(np.log(NO_INIT),  dtype='float32', name='log_no')
+log_krw   = tf.Variable(np.log(KRW_INIT), dtype='float32', name='log_krw')
+log_kro   = tf.Variable(np.log(KRO_INIT), dtype='float32', name='log_kro')
 
 # Cubic viscosity  μw(Cp) = MU_WI·(1 + r·Cp + s·Cp² + t·Cp³)  (Liu et al. Eq.1)
 # r, s, t are raw (unconstrained) — positivity enforced via softplus
-log_r  = tf.Variable(1.0,  dtype='f4', name='log_r')
-log_s  = tf.Variable(0.0,  dtype='f4', name='log_s')
-log_t  = tf.Variable(-1.0, dtype='f4', name='log_t')
+log_r  = tf.Variable(1.0,  dtype='float32', name='log_r')
+log_s  = tf.Variable(0.0,  dtype='float32', name='log_s')
+log_t  = tf.Variable(-1.0, dtype='float32', name='log_t')
 
 # Pore-volume scale (BL ODE time scale)
-log_vp    = tf.Variable(0.0, dtype='f4', name='log_vp')
+log_vp    = tf.Variable(0.0, dtype='float32', name='log_vp')
 # Polymer transport time scale
-log_vp_cp = tf.Variable(0.0, dtype='f4', name='log_vp_cp')
+log_vp_cp = tf.Variable(0.0, dtype='float32', name='log_vp_cp')
 # Oil-rate scaling factor
-log_qsc   = tf.Variable(0.0, dtype='f4', name='log_qsc')
+log_qsc   = tf.Variable(0.0, dtype='float32', name='log_qsc')
 
 phys_vars = [log_nw, log_no, log_krw, log_kro,
              log_r, log_s, log_t,
@@ -175,11 +175,11 @@ def get_phys():
 # ==============================================================================
 # 5.  FRACTIONAL FLOW — CUBIC POLYMER VISCOSITY  (Liu et al. Eq. 1, 3)
 # ==============================================================================
-_SWC  = tf.constant(SWC,         dtype='f4')
-_SOR  = tf.constant(SOR,         dtype='f4')
-_DENOM= tf.constant(1.-SWC-SOR,  dtype='f4')
-_MUO  = tf.constant(MU_O,        dtype='f4')
-_MUWI = tf.constant(MU_WI,       dtype='f4')
+_SWC  = tf.constant(SWC,         dtype='float32')
+_SOR  = tf.constant(SOR,         dtype='float32')
+_DENOM= tf.constant(1.-SWC-SOR,  dtype='float32')
+_MUO  = tf.constant(MU_O,        dtype='float32')
+_MUWI = tf.constant(MU_WI,       dtype='float32')
 
 def fractional_flow(Sw_norm, Cp_out_norm):
     """
@@ -275,7 +275,7 @@ W21, W22      = 1.0, 5.0         # ω21 (polymer PDE), ω22 (IC Cp)
 # Artificial viscosity coefficient  (Liu et al. Example 3, ε=1e-3 optimal)
 EPS_AV = 1e-3
 
-_SW_INIT_NORM = tf.constant((SW_INIT - SWC) / (1. - SWC - SOR), dtype='f4')
+_SW_INIT_NORM = tf.constant((SW_INIT - SWC) / (1. - SWC - SOR), dtype='float32')
 
 
 def pinn_losses(model, x_data, y_data,
@@ -294,8 +294,8 @@ def pinn_losses(model, x_data, y_data,
         x_ic  = X_ic
 
     # ── (a)  Physics residuals on LHS collocation points ─────────────────────
-    t_col  = tf.convert_to_tensor(x_col[:, 0:1], dtype='f4')
-    cpi_col= tf.convert_to_tensor(x_col[:, 1:2], dtype='f4')
+    t_col  = tf.convert_to_tensor(x_col[:, 0:1], dtype='float32')
+    cpi_col= tf.convert_to_tensor(x_col[:, 1:2], dtype='float32')
 
     # Nested tapes for 1st and 2nd derivatives  (Liu et al. artificial viscosity)
     with tf.GradientTape(persistent=True) as tape2:
@@ -329,8 +329,8 @@ def pinn_losses(model, x_data, y_data,
     L_PDE_Cp = tf.reduce_mean(tf.square(R_Cp))
 
     # ── (b)  Initial condition residuals  (Liu et al. Eq. 5) ─────────────────
-    t_ic   = tf.convert_to_tensor(x_ic[:, 0:1], dtype='f4')   # T = 0
-    cpi_ic = tf.convert_to_tensor(x_ic[:, 1:2], dtype='f4')
+    t_ic   = tf.convert_to_tensor(x_ic[:, 0:1], dtype='float32')   # T = 0
+    cpi_ic = tf.convert_to_tensor(x_ic[:, 1:2], dtype='float32')
 
     out_ic    = model([t_ic, cpi_ic], training=False)
     Sw_ic     = out_ic[:, 0:1]
@@ -342,8 +342,8 @@ def pinn_losses(model, x_data, y_data,
     L_IC_Cp   = tf.reduce_mean(tf.square(Cp_out_ic))
 
     # ── (c)  Data loss on observed points  (Meng et al. Eq. 9) ───────────────
-    t_d   = tf.convert_to_tensor(x_data[:, 0:1], dtype='f4')
-    cpi_d = tf.convert_to_tensor(x_data[:, 1:2], dtype='f4')
+    t_d   = tf.convert_to_tensor(x_data[:, 0:1], dtype='float32')
+    cpi_d = tf.convert_to_tensor(x_data[:, 1:2], dtype='float32')
 
     out_d     = model([t_d, cpi_d], training=training)
     Sw_d      = out_d[:, 0:1]
@@ -353,8 +353,8 @@ def pinn_losses(model, x_data, y_data,
     _, _, _, _, _, _, _, _, _, qsc = get_phys()
     qo_d      = qsc * (1. - fw_d)
 
-    wc_obs    = tf.convert_to_tensor(y_data[:, 0:1], dtype='f4')
-    oil_obs   = tf.convert_to_tensor(y_data[:, 1:2], dtype='f4')
+    wc_obs    = tf.convert_to_tensor(y_data[:, 0:1], dtype='float32')
+    oil_obs   = tf.convert_to_tensor(y_data[:, 1:2], dtype='float32')
     L_data    = (tf.reduce_mean(tf.square(fw_d - wc_obs)) +
                  tf.reduce_mean(tf.square(qo_d - oil_obs)))
 
@@ -571,8 +571,8 @@ print(f"  q_scale     = {qsc_l:.4f}")
 # ==============================================================================
 def pinn_predict(X):
     """Returns [fw (water cut), oil_rate_norm] from the PINN physics path."""
-    t_in   = tf.constant(X[:, 0:1], dtype='f4')
-    cpi_in = tf.constant(X[:, 1:2], dtype='f4')
+    t_in   = tf.constant(X[:, 0:1], dtype='float32')
+    cpi_in = tf.constant(X[:, 1:2], dtype='float32')
     out    = pinn_model([t_in, cpi_in], training=False)
     Sw_n   = out[:, 0:1]
     Cp_n   = out[:, 1:2]
@@ -742,7 +742,7 @@ plt.savefig('fig3_match.png', dpi=150, bbox_inches='tight'); plt.show()
 
 # ── Fig 4: Learned fractional flow curves  (interpretability) ────────────────
 fig4, ax4 = plt.subplots(figsize=(8, 5))
-Sw_vals     = np.linspace(SWC, 1.-SOR, 200, dtype='f4')
+Sw_vals     = np.linspace(SWC, 1.-SOR, 200, dtype='float32')
 Sw_norm_arr = tf.constant(((Sw_vals-SWC)/(1.-SWC-SOR)).reshape(-1,1))
 colors      = plt.cm.plasma(np.linspace(0.1, 0.9, 7))
 for col, cpi_v in zip(colors, np.linspace(POLY_MIN, POLY_MAX, 7)):
