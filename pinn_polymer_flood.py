@@ -44,16 +44,16 @@ DATA_DIR = r'C:\Users\faust\OneDrive\Desktop\PINN\CMG\TRAINING 2\Excel data'
 # ==============================================================================
 # 1.  PHYSICAL PRIORS
 # ==============================================================================
-SWC      = 0.23          # connate water saturation (Swr, CMG Corey curve — paper Sec. 2.3)
+SWC      = 0.30          # connate water saturation (Swi, Delaplace 2013 — used in 1D BL model)
 SOR      = 0.20          # residual oil saturation  (Sro, paper Sec. 2.3)
-NW       = 3.0           # Corey exponent water     (paper Sec. 2.3 — fixed, not trainable)
-NO       = 2.2           # Corey exponent oil       (paper Sec. 2.3 — fixed, not trainable)
-KRW_MAX  = 0.10          # endpoint rel-perm water  (paper Sec. 2.3 — fixed, not trainable)
-KRO_MAX  = 1.00          # endpoint rel-perm oil    (paper Sec. 2.3 — fixed, not trainable)
+NW_INIT  = 3.0           # Corey exponent water — initial guess (paper Sec. 2.3)
+NO_INIT  = 2.2           # Corey exponent oil   — initial guess (paper Sec. 2.3)
+KRW_MAX  = 0.10          # endpoint rel-perm water  (paper Sec. 2.3 — fixed)
+KRO_MAX  = 1.00          # endpoint rel-perm oil    (paper Sec. 2.3 — fixed)
 MU_O     = 1650.0        # oil viscosity [cp]       (paper Table 2)
 MU_WI    = 1.0           # pure-water viscosity [cp]
 FWM      = 0.12          # mobile water fraction    (paper Sec. 2.5, calibrated)
-SW_INIT  = 0.36          # initial water saturation (Swinitial, paper Sec. 2.5 — calibrated)
+SW_INIT  = SWC + FWM * (1.0 - SWC - SOR)   # = 0.36, initial reservoir Sw
 
 # Pelican Lake HP-6 geometry
 L_INJE   = 175.0         # injector-producer spacing [m]
@@ -197,23 +197,29 @@ print(f"[COLLOC] Interior={N_COLLOC} | IC={N_IC} | InjectorBC={N_BC}")
 
 # ==============================================================================
 # 4.  PHYSICAL PARAMETERS
-#     Corey exponents and endpoints are KNOWN from paper Sec. 2.3 → fixed constants.
-#     Cubic viscosity coefficients (r, s, t) and oil-rate scale (qsc) are unknown
-#     and must be learned from production data → trainable variables.
+#     krw_max=0.1 and kro_max=1.0 are fixed (paper Sec. 2.3 — well constrained).
+#
+#     nw and no are TRAINABLE, initialized at paper values (3.0, 2.2).
+#     Reason: the CMG Corey values are for the 3D BHP-controlled model. The 1D BL
+#     surrogate requires "effective" exponents that reproduce the observed initial
+#     WC=0.17 simultaneously with the BL equation. With fixed nw=3/no=2.2 and
+#     SWC=0.23, fw(SW_INIT=0.36)=0.77 — irreconcilably inconsistent with data.
+#     Making nw, no trainable lets the PINN find the effective 1D values.
 #
 #     vp = q·T_ref/(A·φ·L) is computed EXACTLY from injection files → fixed constant.
 # ==============================================================================
 
-# Fixed constants — known from CMG model (paper Sec. 2.3)
-_NW  = tf.constant(NW,      dtype='float32')   # Corey exponent water
-_NO  = tf.constant(NO,      dtype='float32')   # Corey exponent oil
-_KRW = tf.constant(KRW_MAX, dtype='float32')   # endpoint krw
-_KRO = tf.constant(KRO_MAX, dtype='float32')   # endpoint kro
+# Fixed constants — endpoints from paper Sec. 2.3
+_KRW = tf.constant(KRW_MAX, dtype='float32')
+_KRO = tf.constant(KRO_MAX, dtype='float32')
 
 # vp as a fixed TF constant — exact value from injection rate files + geometry
 _VP = tf.constant(VP_EXACT, dtype='float32')
 
-# Trainable parameters — only those NOT known from the paper
+# Trainable Corey exponents — initialized at paper values, learned as effective 1D params
+log_nw  = tf.Variable(np.log(NW_INIT), dtype='float32', name='log_nw')
+log_no  = tf.Variable(np.log(NO_INIT), dtype='float32', name='log_no')
+
 # Cubic viscosity coefficients  μw(Cp) = μwi(1+r·Cp+s·Cp²+t·Cp³)
 log_r   = tf.Variable(1.0,  dtype='float32', name='log_r')
 log_s   = tf.Variable(0.0,  dtype='float32', name='log_s')
@@ -222,15 +228,17 @@ log_t   = tf.Variable(-1.0, dtype='float32', name='log_t')
 # Oil-rate scaling factor (accounts for unit conversion and well geometry)
 log_qsc = tf.Variable(0.0, dtype='float32', name='log_qsc')
 
-phys_vars = [log_r, log_s, log_t, log_qsc]
+phys_vars = [log_nw, log_no, log_r, log_s, log_t, log_qsc]
 
 
 def get_phys():
+    nw  = tf.exp(log_nw)
+    no  = tf.exp(log_no)
     r_v = tf.nn.softplus(log_r)
     s_v = tf.nn.softplus(log_s)
     t_v = tf.nn.softplus(log_t)
     qsc = tf.exp(log_qsc)
-    return r_v, s_v, t_v, qsc
+    return nw, no, r_v, s_v, t_v, qsc
 
 # ==============================================================================
 # 5.  FRACTIONAL FLOW — CUBIC POLYMER VISCOSITY  (Liu et al. Eq. 1, 3)
@@ -247,13 +255,13 @@ def fractional_flow(Sw_norm, Cp_norm):
     Cp_norm ∈ [0,1] → normalised polymer concentration
     Returns fw (fractional flow) and physical Sw.
     """
-    r_v, s_v, t_v, *_ = get_phys()
+    nw, no, r_v, s_v, t_v, *_ = get_phys()
 
     Sw    = _SWC + Sw_norm * _DENOM
     Se    = tf.clip_by_value((Sw - _SWC) / (_DENOM + 1e-8), 0., 1.)
 
-    krw_f = _KRW * tf.pow(Se + 1e-8,       _NW)   # Corey krw (paper Sec. 2.3)
-    kro_f = _KRO * tf.pow(1. - Se + 1e-8,  _NO)   # Corey kro (paper Sec. 2.3)
+    krw_f = _KRW * tf.pow(Se + 1e-8,       nw)    # Corey krw
+    kro_f = _KRO * tf.pow(1. - Se + 1e-8,  no)    # Corey kro
 
     # Liu et al. Eq. 1 — cubic polymer viscosity
     mu_w  = _MUWI * (1. + r_v*Cp_norm + s_v*Cp_norm**2 + t_v*Cp_norm**3)
@@ -390,7 +398,7 @@ def pinn_losses(model, x_data, y_data,
     dfwCp_dX = tape1.gradient(fwCp_c, X_c)   # ∂(fw·Cp)/∂X
     del tape1
 
-    _, _, _, qsc = get_phys()
+    _, _, _, _, _, qsc = get_phys()
 
     # BL equation  (Liu et al. Eq. 9)
     # ∂Sw/∂T + vp·∂fw/∂X = 0
@@ -435,7 +443,7 @@ def pinn_losses(model, x_data, y_data,
     T_d   = tf.convert_to_tensor(x_data[:, 1:2], dtype='float32')
     C_d   = tf.convert_to_tensor(x_data[:, 2:3], dtype='float32')
 
-    _, _, _, qsc = get_phys()
+    _, _, _, _, _, qsc = get_phys()
     out_d    = model([X_d, T_d, C_d], training=training)
     Sw_d     = out_d[:, 0:1]
     Cp_d     = out_d[:, 1:2]
@@ -534,13 +542,15 @@ def train_pinn(model, tag='PINN-1D'):
             best_w   = model.get_weights()
 
         if ep % 100 == 0 or ep == 1:
+            nw_ = float(tf.exp(log_nw))
+            no_ = float(tf.exp(log_no))
             r_  = float(tf.nn.softplus(log_r))
             s_  = float(tf.nn.softplus(log_s))
             t_  = float(tf.nn.softplus(log_t))
             print(f"  Ep {ep:4d} | Ldata={hist['tr_data'][-1]:.5f} "
                   f"| BL={hist['tr_bl'][-1]:.5f} "
                   f"| Cp={hist['tr_cp'][-1]:.5f} | Val={val_loss:.5f} "
-                  f"| r={r_:.2f} s={s_:.2f} t={t_:.2f}")
+                  f"| nw={nw_:.2f} no={no_:.2f} r={r_:.2f} s={s_:.2f} t={t_:.2f}")
 
     model.set_weights(best_w)
 
@@ -635,6 +645,8 @@ pinn_hist = train_pinn(pinn_model, 'PINN-1D')
 nn_hist   = train_nn(nn_model,     'Pure NN')
 
 # Report physics parameters
+nw_l  = float(tf.exp(log_nw))
+no_l  = float(tf.exp(log_no))
 r_l   = float(tf.nn.softplus(log_r))
 s_l   = float(tf.nn.softplus(log_s))
 t_l   = float(tf.nn.softplus(log_t))
@@ -644,8 +656,8 @@ print("\n[PHYSICS] Parameters:")
 print(f"  vp (EXACT) = {VP_EXACT:.4f}  ← q·T_ref/(A·φ·L), not trainable")
 print(f"               q={Q_PER_PAIR:.1f} bbl/d | A={A_M2:.0f} m² | "
       f"φ={PHI} | L={L_INJE} m | T={T_REF_DAYS:.0f} d")
-print(f"  Corey nw   = {NW}  (FIXED — paper Sec. 2.3)")
-print(f"  Corey no   = {NO}  (FIXED — paper Sec. 2.3)")
+print(f"  Corey nw   = {nw_l:.4f}  (learned, init={NW_INIT})")
+print(f"  Corey no   = {no_l:.4f}  (learned, init={NO_INIT})")
 print(f"  krw_max    = {KRW_MAX}  (FIXED — paper Sec. 2.3)")
 print(f"  kro_max    = {KRO_MAX}  (FIXED — paper Sec. 2.3)")
 print(f"  Cubic r    = {r_l:.4f}  (learned)")
@@ -670,7 +682,7 @@ def pinn_predict(X_arr):
     Sw_n  = out[:, 0:1]
     Cp_n  = out[:, 1:2]
     fw, _ = fractional_flow(Sw_n, Cp_n)
-    _, _, _, qsc = get_phys()
+    _, _, _, _, _, qsc = get_phys()
     return np.concatenate([fw.numpy(), (qsc*(1.-fw)).numpy()], axis=1)
 
 
